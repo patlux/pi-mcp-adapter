@@ -77,6 +77,59 @@ describe("McpServerManager sampling", () => {
     );
   });
 
+  it("advertises elicitation capabilities and registers the handler before connecting", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    const manager = new McpServerManager();
+    manager.setElicitationConfig({
+      autoOpenUrls: false,
+      ui: {} as any,
+    });
+
+    await manager.connect("demo", { command: "node", args: ["server.js"] });
+
+    const client = mocks.clients[0];
+    expect(client.options).toEqual({
+      capabilities: {
+        elicitation: {
+          form: { applyDefaults: true },
+          url: {},
+        },
+      },
+    });
+    expect(client.setRequestHandler).toHaveBeenCalledTimes(1);
+    expect(client.setRequestHandler.mock.invocationCallOrder[0]).toBeLessThan(
+      client.connect.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("advertises sampling and elicitation together", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    const manager = new McpServerManager();
+    manager.setSamplingConfig({
+      autoApprove: true,
+      modelRegistry: {} as any,
+      getCurrentModel: () => undefined,
+      getSignal: () => undefined,
+    });
+    manager.setElicitationConfig({
+      autoOpenUrls: false,
+      ui: {} as any,
+    });
+
+    await manager.connect("demo", { command: "node", args: ["server.js"] });
+
+    expect(mocks.clients[0].options).toEqual({
+      capabilities: {
+        sampling: {},
+        elicitation: {
+          form: { applyDefaults: true },
+          url: {},
+        },
+      },
+    });
+    expect(mocks.clients[0].setRequestHandler).toHaveBeenCalledTimes(2);
+  });
+
   it("does not advertise sampling when no sampling config is set", async () => {
     const { McpServerManager } = await import("../server-manager.ts");
     const manager = new McpServerManager();

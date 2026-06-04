@@ -169,8 +169,14 @@ For pre-registered browser OAuth clients, set `oauth.redirectUri` to the exact c
 | `autoAuth` | Auto-run OAuth on `connect`/tool calls when a server needs auth, then retry once (default: false). |
 | `sampling` | Allow MCP servers to sample through Pi models, honoring `modelPreferences.hints` before current/default fallback (default: true when UI approval is available). |
 | `samplingAutoApprove` | Skip sampling confirmation prompts. Required for sampling in non-UI sessions (default: false). |
+| `elicitation` | Allow MCP servers to request user input through Pi UI forms/URL prompts (default: true when Pi UI form support is available). |
+| `elicitationAutoOpenUrls` | Automatically open URL elicitations without prompting first (default: false). |
 
 Per-server `idleTimeout` overrides the global setting.
+
+### MCP Elicitation
+
+When Pi exposes UI, the adapter advertises MCP elicitation support. Form elicitations are rendered with `ctx.ui.form()` and map Pi actions to MCP actions: submit → `accept`, secondary → `decline`, cancel → `cancel`. URL elicitations prompt before opening a browser unless `elicitationAutoOpenUrls` is enabled.
 
 ### Direct Tools
 

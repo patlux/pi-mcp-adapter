@@ -43,6 +43,16 @@ export async function initializeMcp(
       getSignal: () => ctx.signal,
     });
   }
+  const elicitationEnabled =
+    config.settings?.elicitation !== false &&
+    ctx.hasUI &&
+    typeof (ctx.ui as { form?: unknown }).form === "function";
+  if (elicitationEnabled) {
+    manager.setElicitationConfig({
+      ui: ctx.ui as any,
+      autoOpenUrls: config.settings?.elicitationAutoOpenUrls === true,
+    });
+  }
   const lifecycle = new McpLifecycleManager(manager);
   const toolMetadata = new Map<string, ToolMetadata[]>();
   const failureTracker = new Map<string, number>();
