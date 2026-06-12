@@ -219,6 +219,9 @@ export function coerceAndValidateFormValues(
       continue;
     }
     if (schema.type === "number" || schema.type === "integer") {
+      if (typeof value === "string" && value.trim() === "") {
+        throw new Error(`Elicitation field ${name} must be a number`);
+      }
       const numberValue = typeof value === "number" ? value : Number(value);
       if (!Number.isFinite(numberValue)) throw new Error(`Elicitation field ${name} must be a number`);
       if (schema.type === "integer" && !Number.isInteger(numberValue)) {

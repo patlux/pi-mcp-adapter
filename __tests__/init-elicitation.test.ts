@@ -1,4 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionMode,
+  ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
 
 const mocks = vi.hoisted(() => ({
   loadMcpConfig: vi.fn(),
@@ -20,15 +26,21 @@ vi.mock("../server-manager.ts", () => ({
   }),
 }));
 
-function context(overrides: Record<string, unknown> = {}) {
+function context(overrides: { hasUI?: boolean; mode?: ExtensionMode } = {}): ExtensionContext {
   return {
     cwd: "/tmp/project",
     hasUI: true,
     mode: "tui",
-    ui: { select: vi.fn(), input: vi.fn(), notify: vi.fn() },
+    ui: { select: vi.fn(), input: vi.fn(), notify: vi.fn() } as unknown as ExtensionUIContext,
     modelRegistry: {},
+    model: undefined,
+    signal: undefined,
     ...overrides,
-  } as any;
+  } as unknown as ExtensionContext;
+}
+
+function extensionApi(): ExtensionAPI {
+  return { getFlag: vi.fn() } as unknown as ExtensionAPI;
 }
 
 describe("initializeMcp elicitation config", () => {
@@ -41,7 +53,7 @@ describe("initializeMcp elicitation config", () => {
     const { initializeMcp } = await import("../init.ts");
     const ctx = context();
 
-    await initializeMcp({ getFlag: vi.fn() } as any, ctx);
+    await initializeMcp(extensionApi(), ctx);
 
     expect(mocks.managers[0].setElicitationConfig).toHaveBeenCalledWith({
       ui: ctx.ui,
@@ -53,7 +65,7 @@ describe("initializeMcp elicitation config", () => {
     const { initializeMcp } = await import("../init.ts");
     const ctx = context({ mode: "rpc" });
 
-    await initializeMcp({ getFlag: vi.fn() } as any, ctx);
+    await initializeMcp(extensionApi(), ctx);
 
     expect(mocks.managers[0].setElicitationConfig).toHaveBeenCalledWith({
       ui: ctx.ui,
@@ -64,11 +76,11 @@ describe("initializeMcp elicitation config", () => {
   it("does not enable elicitation without UI or when disabled", async () => {
     const { initializeMcp } = await import("../init.ts");
 
-    await initializeMcp({ getFlag: vi.fn() } as any, context({ hasUI: false }));
+    await initializeMcp(extensionApi(), context({ hasUI: false }));
     expect(mocks.managers[0].setElicitationConfig).not.toHaveBeenCalled();
 
     mocks.loadMcpConfig.mockReturnValue({ mcpServers: {}, settings: { elicitation: false } });
-    await initializeMcp({ getFlag: vi.fn() } as any, context());
+    await initializeMcp(extensionApi(), context());
     expect(mocks.managers[1].setElicitationConfig).not.toHaveBeenCalled();
   });
 });

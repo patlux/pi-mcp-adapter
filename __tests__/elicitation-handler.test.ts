@@ -115,6 +115,41 @@ describe("MCP elicitation", () => {
     expect(result).toEqual({ action: "accept", content: { email: "octocat@example.com" } });
   });
 
+  it.each([
+    ["number", false],
+    ["number", true],
+    ["integer", false],
+    ["integer", true],
+  ] as const)("rejects blank %s input and reprompts when required=%s", async (type, required) => {
+    const { handleElicitationRequest } = await import("../elicitation-handler.ts");
+    const ui = {
+      select: vi.fn()
+        .mockResolvedValueOnce("Continue")
+        .mockResolvedValueOnce("Enter value")
+        .mockResolvedValueOnce("Enter value")
+        .mockResolvedValueOnce("Submit"),
+      input: vi.fn().mockResolvedValueOnce("   ").mockResolvedValueOnce("7"),
+      notify: vi.fn(),
+    };
+
+    const result = await handleElicitationRequest(
+      { serverName: "demo", ui: ui as any, allowUrl: false },
+      request({
+        mode: "form",
+        message: "Choose a quantity",
+        requestedSchema: {
+          type: "object",
+          properties: { quantity: { type } },
+          ...(required ? { required: ["quantity"] } : {}),
+        },
+      }),
+    );
+
+    expect(ui.notify).toHaveBeenCalledWith("Elicitation field quantity must be a number", "error");
+    expect(ui.input).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ action: "accept", content: { quantity: 7 } });
+  });
+
   it("maps explicit refusal and dialog dismissal to decline and cancel", async () => {
     const { handleElicitationRequest } = await import("../elicitation-handler.ts");
     const params = request({

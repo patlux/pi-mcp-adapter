@@ -25,16 +25,8 @@ import { getMissingConfiguredDirectToolServers } from "./direct-tools.ts";
 
 const FAILURE_BACKOFF_MS = 60 * 1000;
 
-export function isLocalTui(ctx: Pick<ExtensionContext, "hasUI"> & { mode?: string }): boolean {
-  if (!ctx.hasUI) return false;
-  if (ctx.mode !== undefined) return ctx.mode === "tui";
-
-  const modeFlag = process.argv.find(arg => arg.startsWith("--mode="))?.slice("--mode=".length);
-  const modeIndex = process.argv.indexOf("--mode");
-  const mode = modeFlag ?? (modeIndex >= 0 ? process.argv[modeIndex + 1] : undefined);
-  if (mode) return mode === "tui";
-  if (process.argv.includes("-p") || process.argv.includes("--print")) return false;
-  return process.stdin.isTTY === true && process.stdout.isTTY === true;
+export function isLocalTui(ctx: Pick<ExtensionContext, "hasUI" | "mode">): boolean {
+  return ctx.hasUI && ctx.mode === "tui";
 }
 
 export async function initializeMcp(
@@ -59,7 +51,7 @@ export async function initializeMcp(
   if (elicitationEnabled) {
     manager.setElicitationConfig({
       ui: ctx.ui,
-      allowUrl: isLocalTui(ctx as ExtensionContext & { mode?: string }),
+      allowUrl: isLocalTui(ctx),
     });
   }
   const lifecycle = new McpLifecycleManager(manager);
