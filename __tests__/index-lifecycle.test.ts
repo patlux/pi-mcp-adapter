@@ -62,6 +62,14 @@ vi.mock("../direct-tools.ts", () => ({
   resolveDirectTools: mocks.resolveDirectTools,
 }));
 
+// Startup-light spec module used by index.ts at factory time; the heavy
+// executor half stays in ../direct-tools.ts (loaded lazily).
+vi.mock("../direct-tool-specs.ts", () => ({
+  buildProxyDescription: mocks.buildProxyDescription,
+  getMissingConfiguredDirectToolServers: mocks.getMissingConfiguredDirectToolServers,
+  resolveDirectTools: mocks.resolveDirectTools,
+}));
+
 vi.mock("../commands.ts", () => ({
   showStatus: mocks.showStatus,
   showTools: mocks.showTools,
@@ -350,29 +358,26 @@ describe("mcpAdapter session lifecycle", () => {
     expect(sessionStart).toBeTypeOf("function");
 
     await sessionStart?.({}, {});
-    expect(mocks.initializeMcp).toHaveBeenCalledTimes(1);
+    // session_start no longer blocks on the lazy module import; wait for the
+    // background init chain to reach initializeMcp.
+    await vi.waitFor(() => expect(mocks.initializeMcp).toHaveBeenCalledTimes(1));
     expect(mocks.shutdownOAuth).toHaveBeenCalledTimes(1);
 
     await sessionStart?.({}, {});
-    expect(mocks.initializeMcp).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(mocks.initializeMcp).toHaveBeenCalledTimes(2));
     expect(mocks.shutdownOAuth).toHaveBeenCalledTimes(2);
 
     const activeState = createState();
     second.resolve(activeState);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(mocks.updateStatusBar).toHaveBeenCalledWith(activeState);
+    await vi.waitFor(() => expect(mocks.updateStatusBar).toHaveBeenCalledWith(activeState));
     expect(activeState.lifecycle.gracefulShutdown).not.toHaveBeenCalled();
 
     const staleState = createState();
     first.resolve(staleState);
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(staleState.lifecycle.gracefulShutdown).toHaveBeenCalledTimes(1));
 
     expect(mocks.updateStatusBar).not.toHaveBeenCalledWith(staleState);
     expect(mocks.flushMetadataCache).toHaveBeenCalledWith(staleState);
-    expect(staleState.lifecycle.gracefulShutdown).toHaveBeenCalledTimes(1);
   });
 
   it("shuts down OAuth on session_shutdown", async () => {
@@ -387,8 +392,9 @@ describe("mcpAdapter session lifecycle", () => {
     const sessionShutdown = handlers.get("session_shutdown");
 
     await sessionStart?.({}, {});
-    await Promise.resolve();
-    await Promise.resolve();
+    // Wait until the background init chain fully settled (state assigned)
+    // before clearing, so the session_start shutdownOAuth call is not counted.
+    await vi.waitFor(() => expect(mocks.updateStatusBar).toHaveBeenCalled());
 
     mocks.shutdownOAuth.mockClear();
 

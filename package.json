@@ -48,6 +48,7 @@
     "ui-session.ts",
     "proxy-modes.ts",
     "direct-tools.ts",
+    "direct-tool-specs.ts",
     "commands.ts",
     "onboarding-state.ts",
     "mcp-setup-panel.ts",

@@ -1,24 +1,47 @@
 import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
 import type { McpExtensionState } from "./state.ts";
 import { Type } from "typebox";
-import { showStatus, showTools, reconnectServers, authenticateServer, logoutServer, openMcpAuthPanel, openMcpPanel, openMcpSetup } from "./commands.ts";
 import { loadMcpConfig } from "./config.ts";
-import { buildProxyDescription, createDirectToolExecutor, getMissingConfiguredDirectToolServers, resolveDirectTools } from "./direct-tools.ts";
-import { flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
+import { buildProxyDescription, getMissingConfiguredDirectToolServers, resolveDirectTools } from "./direct-tool-specs.ts";
 import { loadMetadataCache } from "./metadata-cache.ts";
-import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, executeDescribe, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
 import { getConfigPathFromArgv, normalizeDirectToolInputSchema, truncateAtWord } from "./utils.ts";
-import { initializeOAuth, shutdownOAuth } from "./mcp-auth-flow.ts";
 import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolResult } from "./tool-result-renderer.ts";
 import { toolErrorOverride } from "./error-signal.ts";
 
+// The MCP runtime graph (SDK, server manager, panels, OAuth, recheck) is
+// expensive to import (~50-80ms). Keep it out of the extension factory so pi
+// startup stays fast; session_start kicks the import off in the background
+// and every handler awaits the cached promise (a no-op once loaded).
+type HeavyModules = {
+  commands: typeof import("./commands.ts");
+  init: typeof import("./init.ts");
+  proxy: typeof import("./proxy-modes.ts");
+  auth: typeof import("./mcp-auth-flow.ts");
+  direct: typeof import("./direct-tools.ts");
+};
+let heavyModules: Promise<HeavyModules> | null = null;
+function heavy(): Promise<HeavyModules> {
+  heavyModules ??= (async () => {
+    const [commands, init, proxy, auth, direct] = await Promise.all([
+      import("./commands.ts"),
+      import("./init.ts"),
+      import("./proxy-modes.ts"),
+      import("./mcp-auth-flow.ts"),
+      import("./direct-tools.ts"),
+    ]);
+    return { commands, init, proxy, auth, direct };
+  })();
+  return heavyModules;
+}
+
 export default function mcpAdapter(pi: ExtensionAPI) {
   let state: McpExtensionState | null = null;
-  let initPromise: Promise<McpExtensionState> | null = null;
+  let initPromise: Promise<McpExtensionState | null> | null = null;
   let lifecycleGeneration = 0;
 
   async function shutdownState(currentState: McpExtensionState | null, reason: string): Promise<void> {
     if (!currentState) return;
+    const { init } = await heavy();
 
     if (currentState.uiServer) {
       currentState.uiServer.close(reason);
@@ -27,7 +50,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
 
     let flushError: unknown;
     try {
-      flushMetadataCache(currentState);
+      init.flushMetadataCache(currentState);
     } catch (error) {
       flushError = error;
     }
@@ -74,7 +97,16 @@ export default function mcpAdapter(pi: ExtensionAPI) {
       description: spec.description || "(no description)",
       promptSnippet: truncateAtWord(spec.description, 100) || `MCP tool from ${spec.serverName}`,
       parameters: Type.Unsafe(normalizeDirectToolInputSchema(spec.inputSchema) as never),
-      execute: createDirectToolExecutor(() => state, () => initPromise, spec),
+      execute: async (toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown) => {
+        const { direct } = await heavy();
+        return direct.createDirectToolExecutor(() => state, () => initPromise, spec)(
+          toolCallId,
+          params,
+          signal,
+          onUpdate as never,
+          ctx as never,
+        );
+      },
       renderCall: createMcpDirectToolCallRenderer(spec.prefixedName),
       renderResult: renderMcpToolResult,
     });
@@ -87,30 +119,37 @@ export default function mcpAdapter(pi: ExtensionAPI) {
     type: "string",
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  // Intentionally not awaiting the heavy import here: the handler returns
+  // immediately so pi startup is not blocked; MCP init continues in the
+  // background exactly like the previous initializeMcp().then() flow.
+  pi.on("session_start", (_event, ctx) => {
     const generation = ++lifecycleGeneration;
     const previousState = state;
     state = null;
     initPromise = null;
 
-    try {
-      await Promise.all([
-        shutdownState(previousState, "session_restart"),
-        shutdownOAuth(),
-      ]);
-    } catch (error) {
-      console.error("MCP: failed to shut down previous session state", error);
-    }
+    const promise = (async (): Promise<McpExtensionState | null> => {
+      const { init, auth } = await heavy();
 
-    if (generation !== lifecycleGeneration) {
-      return;
-    }
+      try {
+        await Promise.all([
+          shutdownState(previousState, "session_restart"),
+          auth.shutdownOAuth(),
+        ]);
+      } catch (error) {
+        console.error("MCP: failed to shut down previous session state", error);
+      }
 
-    await initializeOAuth().catch(err => {
-      console.error("MCP OAuth initialization failed:", err);
-    });
+      if (generation !== lifecycleGeneration) {
+        return null;
+      }
 
-    const promise = initializeMcp(pi, ctx);
+      await auth.initializeOAuth().catch(err => {
+        console.error("MCP OAuth initialization failed:", err);
+      });
+
+      return init.initializeMcp(pi, ctx);
+    })();
     initPromise = promise;
 
     promise.then(async (nextState) => {
@@ -122,9 +161,14 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         }
         return;
       }
+      if (!nextState) {
+        initPromise = null;
+        return;
+      }
 
       state = nextState;
-      updateStatusBar(nextState);
+      const { init } = await heavy();
+      init.updateStatusBar(nextState);
       initPromise = null;
     }).catch(err => {
       if (generation !== lifecycleGeneration) {
@@ -145,10 +189,13 @@ export default function mcpAdapter(pi: ExtensionAPI) {
     initPromise = null;
 
     try {
-      await Promise.all([
-        shutdownState(currentState, "session_shutdown"),
-        shutdownOAuth(),
-      ]);
+      const cleanups: Promise<void>[] = [shutdownState(currentState, "session_shutdown")];
+      // Only touch OAuth if the heavy graph was ever loaded; otherwise there
+      // is nothing to shut down and importing it now would be wasted work.
+      if (heavyModules) {
+        cleanups.push(heavy().then(({ auth }) => auth.shutdownOAuth()));
+      }
+      await Promise.all(cleanups);
     } catch (error) {
       console.error("MCP: session shutdown cleanup failed", error);
     }
@@ -160,6 +207,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
   pi.registerCommand("mcp", {
     description: "Show MCP server status",
     handler: async (args, ctx) => {
+      const { commands } = await heavy();
       if (!state && initPromise) {
         try {
           state = await initPromise;
@@ -181,13 +229,13 @@ export default function mcpAdapter(pi: ExtensionAPI) {
 
       switch (subcommand) {
         case "reconnect":
-          await reconnectServers(state, ctx, targetServer);
+          await commands.reconnectServers(state, ctx, targetServer);
           break;
         case "tools":
-          await showTools(state, ctx);
+          await commands.showTools(state, ctx);
           break;
         case "setup": {
-          const result = await openMcpSetup(state, pi, ctx, earlyConfigPath, "setup");
+          const result = await commands.openMcpSetup(state, pi, ctx, earlyConfigPath, "setup");
           if (result?.configChanged) {
             await ctx.reload();
             return;
@@ -200,20 +248,20 @@ export default function mcpAdapter(pi: ExtensionAPI) {
             if (ctx.hasUI) ctx.ui.notify("Usage: /mcp logout <server>", "error");
             return;
           }
-          await logoutServer(serverName, state, ctx);
+          await commands.logoutServer(serverName, state, ctx);
           break;
         }
         case "status":
         case "":
         default:
           if (ctx.hasUI) {
-            const result = await openMcpPanel(state, pi, ctx, earlyConfigPath);
+            const result = await commands.openMcpPanel(state, pi, ctx, earlyConfigPath);
             if (result?.configChanged) {
               await ctx.reload();
               return;
             }
           } else {
-            await showStatus(state, ctx);
+            await commands.showStatus(state, ctx);
           }
           break;
       }
@@ -227,6 +275,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
       if (!serverName && !ctx.hasUI) {
         return;
       }
+      const { commands } = await heavy();
 
       if (!state && initPromise) {
         try {
@@ -243,11 +292,11 @@ export default function mcpAdapter(pi: ExtensionAPI) {
       }
 
       if (!serverName) {
-        await openMcpAuthPanel(state, pi, ctx, earlyConfigPath);
+        await commands.openMcpAuthPanel(state, pi, ctx, earlyConfigPath);
         return;
       }
 
-      await authenticateServer(serverName, state.config, ctx);
+      await commands.authenticateServer(serverName, state.config, ctx);
     },
   });
 
@@ -297,6 +346,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
           }
         }
 
+        const { proxy } = await heavy();
         if (!state && initPromise) {
           try {
             state = await initPromise;
@@ -316,7 +366,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         }
 
         if (params.action === "ui-messages") {
-          return executeUiMessages(state);
+          return proxy.executeUiMessages(state);
         }
         if (params.action === "auth-start") {
           if (!params.server) {
@@ -325,7 +375,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
               details: { mode: "auth-start", error: "missing_server" },
             };
           }
-          return executeAuthStart(state, params.server);
+          return proxy.executeAuthStart(state, params.server);
         }
         if (params.action === "auth-complete") {
           if (!params.server) {
@@ -341,24 +391,24 @@ export default function mcpAdapter(pi: ExtensionAPI) {
               details: { mode: "auth-complete", error: "missing_input" },
             };
           }
-          return executeAuthComplete(state, params.server, input);
+          return proxy.executeAuthComplete(state, params.server, input);
         }
         if (params.tool) {
-          return executeCall(state, params.tool, parsedArgs, params.server, getPiTools, signal);
+          return proxy.executeCall(state, params.tool, parsedArgs, params.server, getPiTools, signal);
         }
         if (params.connect) {
-          return executeConnect(state, params.connect, signal);
+          return proxy.executeConnect(state, params.connect, signal);
         }
         if (params.describe) {
-          return executeDescribe(state, params.describe);
+          return proxy.executeDescribe(state, params.describe);
         }
         if (params.search) {
-          return executeSearch(state, params.search, params.regex, params.server, params.includeSchemas);
+          return proxy.executeSearch(state, params.search, params.regex, params.server, params.includeSchemas);
         }
         if (params.server) {
-          return executeList(state, params.server);
+          return proxy.executeList(state, params.server);
         }
-        return executeStatus(state);
+        return proxy.executeStatus(state);
       },
     });
   }
