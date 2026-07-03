@@ -168,7 +168,15 @@ export async function authenticateServer(
 
   try {
     ctx.ui.setStatus("mcp-auth", `Authenticating ${serverName}...`);
-    const status = await authenticate(serverName, definition.url, definition);
+    const status = await authenticate(serverName, definition.url, definition, {
+      onAuthorizationUrl: (authorizationUrl) => {
+        ctx.ui.notify(
+          `Open this URL to authenticate ${serverName}:\n\n${authorizationUrl}\n\n` +
+          "After approving, return to Pi; the local callback will complete automatically.",
+          "info"
+        );
+      },
+    });
 
     if (status === "authenticated") {
       const message = `OAuth authentication successful for "${serverName}"! Run /mcp reconnect ${serverName} to connect with the new token.`;
@@ -286,8 +294,8 @@ export async function openMcpSetup(
 
   return new Promise<PanelFlowResult>((resolve) => {
     ctx.ui.custom(
-      (tui, _theme, _keybindings, done) => {
-        return createMcpSetupPanel(discovery, callbacks, { mode, onboardingState }, tui, () => {
+      (tui, _theme, keybindings, done) => {
+        return createMcpSetupPanel(discovery, callbacks, { mode, onboardingState, keybindings }, tui, () => {
           done(undefined);
           resolve({ configChanged });
         });
@@ -358,7 +366,7 @@ export async function openMcpPanel(
 
   await new Promise<void>((resolve) => {
     ctx.ui.custom(
-      (tui, _theme, _keybindings, done) => {
+      (tui, _theme, keybindings, done) => {
         return createMcpPanel(config, cache, provenanceMap, callbacks, tui, (result: McpPanelResult) => {
           if (!result.cancelled && result.changes.size > 0) {
             writeDirectToolsConfig(result.changes, provenanceMap, config);
@@ -367,7 +375,7 @@ export async function openMcpPanel(
           }
           done(undefined);
           resolve();
-        }, { noticeLines });
+        }, { noticeLines, keybindings });
       },
       { overlay: true, overlayOptions: { anchor: "center", width: 82 } },
     );
@@ -403,12 +411,13 @@ export async function openMcpAuthPanel(
 
   await new Promise<void>((resolve) => {
     ctx.ui.custom(
-      (tui, _theme, _keybindings, done) => {
+      (tui, _theme, keybindings, done) => {
         return createMcpPanel(config, cache, provenanceMap, callbacks, tui, () => {
           done(undefined);
           resolve();
         }, {
           authOnly: true,
+          keybindings,
           noticeLines: ["Select an OAuth MCP server and press Enter or ctrl+a to authenticate."],
         });
       },

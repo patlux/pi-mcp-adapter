@@ -22,8 +22,13 @@ import { UiResourceHandler } from "./ui-resource-handler.ts";
 import { openUrl, parallelLimit } from "./utils.ts";
 import { logger } from "./logger.ts";
 import { getMissingConfiguredDirectToolServers } from "./direct-tools.ts";
+import { throwIfAborted } from "./abort.ts";
 
 const FAILURE_BACKOFF_MS = 60 * 1000;
+
+export function isTuiMode(ctx: Pick<ExtensionContext, "hasUI" | "mode">): boolean {
+  return ctx.hasUI && ctx.mode === "tui";
+}
 
 export async function initializeMcp(
   pi: ExtensionAPI,
@@ -32,7 +37,8 @@ export async function initializeMcp(
   const configPath = pi.getFlag("mcp-config") as string | undefined;
   const config = loadMcpConfig(configPath, ctx.cwd);
 
-  const manager = new McpServerManager();
+  const manager = new McpServerManager(ctx.cwd);
+  manager.setDefaultRequestTimeoutMs(config.settings?.requestTimeoutMs);
   const samplingAutoApprove = config.settings?.samplingAutoApprove === true;
   if (config.settings?.sampling !== false && (ctx.hasUI || samplingAutoApprove)) {
     manager.setSamplingConfig({
@@ -41,6 +47,13 @@ export async function initializeMcp(
       modelRegistry: ctx.modelRegistry,
       getCurrentModel: () => ctx.model,
       getSignal: () => ctx.signal,
+    });
+  }
+  const elicitationEnabled = config.settings?.elicitation !== false && ctx.hasUI;
+  if (elicitationEnabled) {
+    manager.setElicitationConfig({
+      ui: ctx.ui,
+      allowUrl: isTuiMode(ctx),
     });
   }
   const lifecycle = new McpLifecycleManager(manager);
@@ -118,7 +131,7 @@ export async function initializeMcp(
 
   const results = await parallelLimit(startupServers, 10, async ([name, definition]) => {
     try {
-      const connection = await manager.connect(name, definition);
+      const connection = await manager.connect(name, definition, ctx.signal);
       if (connection.status === "needs-auth") {
         return { name, definition, connection: null, error: `OAuth authentication required. Run /mcp-auth ${name}.` };
       }
@@ -172,7 +185,7 @@ export async function initializeMcp(
         async (name) => {
           const definition = config.mcpServers[name];
           try {
-            const connection = await manager.connect(name, definition);
+            const connection = await manager.connect(name, definition, ctx.signal);
             if (connection.status === "needs-auth") {
               return { name, ok: false };
             }
@@ -286,7 +299,7 @@ export function getFailureAgeSeconds(state: McpExtensionState, serverName: strin
   return Math.round(ageMs / 1000);
 }
 
-export async function lazyConnect(state: McpExtensionState, serverName: string): Promise<boolean> {
+export async function lazyConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal): Promise<boolean> {
   const connection = state.manager.getConnection(serverName);
   if (connection?.status === "needs-auth") {
     return false;
@@ -306,7 +319,7 @@ export async function lazyConnect(state: McpExtensionState, serverName: string):
     if (state.ui) {
       state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
     }
-    const newConnection = await state.manager.connect(serverName, definition);
+    const newConnection = await state.manager.connect(serverName, definition, signal);
     if (newConnection.status === "needs-auth") {
       return false;
     }
@@ -316,6 +329,9 @@ export async function lazyConnect(state: McpExtensionState, serverName: string):
     updateStatusBar(state);
     return true;
   } catch (error) {
+    if (signal?.aborted) {
+      throwIfAborted(signal);
+    }
     state.failureTracker.set(serverName, Date.now());
     const message = error instanceof Error ? error.message : String(error);
     logger.debug(`MCP: lazy connect failed for ${serverName}: ${message}`);

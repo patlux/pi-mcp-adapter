@@ -6,10 +6,11 @@ import { loadMcpConfig } from "./config.ts";
 import { buildProxyDescription, createDirectToolExecutor, getMissingConfiguredDirectToolServers, resolveDirectTools } from "./direct-tools.ts";
 import { flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
 import { loadMetadataCache } from "./metadata-cache.ts";
-import { executeCall, executeConnect, executeDescribe, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
-import { getConfigPathFromArgv, truncateAtWord } from "./utils.ts";
+import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, executeDescribe, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
+import { getConfigPathFromArgv, normalizeDirectToolInputSchema, truncateAtWord } from "./utils.ts";
 import { initializeOAuth, shutdownOAuth } from "./mcp-auth-flow.ts";
 import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolResult } from "./tool-result-renderer.ts";
+import { toolErrorOverride } from "./error-signal.ts";
 
 export default function mcpAdapter(pi: ExtensionAPI) {
   let state: McpExtensionState | null = null;
@@ -72,7 +73,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
       label: `MCP: ${spec.originalName}`,
       description: spec.description || "(no description)",
       promptSnippet: truncateAtWord(spec.description, 100) || `MCP tool from ${spec.serverName}`,
-      parameters: Type.Unsafe((spec.inputSchema || { type: "object", properties: {} }) as never),
+      parameters: Type.Unsafe(normalizeDirectToolInputSchema(spec.inputSchema) as never),
       execute: createDirectToolExecutor(() => state, () => initPromise, spec),
       renderCall: createMcpDirectToolCallRenderer(spec.prefixedName),
       renderResult: renderMcpToolResult,
@@ -152,6 +153,9 @@ export default function mcpAdapter(pi: ExtensionAPI) {
       console.error("MCP: session shutdown cleanup failed", error);
     }
   });
+
+  // Re-flag returned MCP tool failures so pi registers them as errors (see toolErrorOverride).
+  pi.on("tool_result", (event) => toolErrorOverride(event.details));
 
   pi.registerCommand("mcp", {
     description: "Show MCP server status",
@@ -263,7 +267,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         regex: Type.Optional(Type.Boolean({ description: "Treat search as regex (default: substring match)" })),
         includeSchemas: Type.Optional(Type.Boolean({ description: "Include parameter schemas in search results (default: true)" })),
         server: Type.Optional(Type.String({ description: "Filter to specific server (also disambiguates tool calls)" })),
-        action: Type.Optional(Type.String({ description: "Action: 'ui-messages' to retrieve prompts/intents from UI sessions" })),
+        action: Type.Optional(Type.String({ description: "Action: 'ui-messages', 'auth-start', or 'auth-complete'" })),
       }),
       renderResult: renderMcpToolResult,
       async execute(_toolCallId, params: {
@@ -276,7 +280,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         includeSchemas?: boolean;
         server?: string;
         action?: string;
-      }, _signal, _onUpdate, _ctx) {
+      }, signal, _onUpdate, _ctx) {
         let parsedArgs: Record<string, unknown> | undefined;
         if (params.args) {
           try {
@@ -314,11 +318,36 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         if (params.action === "ui-messages") {
           return executeUiMessages(state);
         }
+        if (params.action === "auth-start") {
+          if (!params.server) {
+            return {
+              content: [{ type: "text" as const, text: "auth-start requires `server`. Example: mcp({ action: \"auth-start\", server: \"linear-server\" })" }],
+              details: { mode: "auth-start", error: "missing_server" },
+            };
+          }
+          return executeAuthStart(state, params.server);
+        }
+        if (params.action === "auth-complete") {
+          if (!params.server) {
+            return {
+              content: [{ type: "text" as const, text: "auth-complete requires `server`." }],
+              details: { mode: "auth-complete", error: "missing_server" },
+            };
+          }
+          const input = parsedArgs?.redirectUrl ?? parsedArgs?.code ?? parsedArgs?.input;
+          if (typeof input !== "string" || input.trim().length === 0) {
+            return {
+              content: [{ type: "text" as const, text: "auth-complete requires args with `redirectUrl`, `code`, or `input`." }],
+              details: { mode: "auth-complete", error: "missing_input" },
+            };
+          }
+          return executeAuthComplete(state, params.server, input);
+        }
         if (params.tool) {
-          return executeCall(state, params.tool, parsedArgs, params.server, getPiTools);
+          return executeCall(state, params.tool, parsedArgs, params.server, getPiTools, signal);
         }
         if (params.connect) {
-          return executeConnect(state, params.connect);
+          return executeConnect(state, params.connect, signal);
         }
         if (params.describe) {
           return executeDescribe(state, params.describe);

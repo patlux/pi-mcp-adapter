@@ -1,4 +1,5 @@
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { createPanelKeys, type PanelKeybindings, type PanelKeys } from "./panel-keys.ts";
 import { isToolExcluded } from "./types.ts";
 import type { McpConfig, McpPanelCallbacks, McpPanelResult, ServerProvenance } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
@@ -73,6 +74,48 @@ function fuzzyScore(query: string, text: string): number {
   return qi === lq.length ? score : 0;
 }
 
+function sanitizeDisplayText(text: string | null | undefined): string {
+  return (text ?? "")
+    .replace(/(?:\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c))/g, "")
+    .replace(/(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_])/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sanitizeRowContent(content: string): string {
+  let result = "";
+  let pendingSpace = false;
+  for (let i = 0; i < content.length; i++) {
+    const rest = content.slice(i);
+    const osc = rest.match(/^(?:\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c))/);
+    if (osc) {
+      i += osc[0].length - 1;
+      continue;
+    }
+
+    const ansi = rest.match(/^(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_])/);
+    if (ansi) {
+      result += ansi[0];
+      i += ansi[0].length - 1;
+      continue;
+    }
+
+    const code = content.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      pendingSpace = true;
+      continue;
+    }
+
+    if (pendingSpace && result && !result.endsWith(" ")) {
+      result += " ";
+    }
+    pendingSpace = false;
+    result += content[i];
+  }
+  return result;
+}
+
 function estimateTokens(tool: CachedTool): number {
   const schemaLen = JSON.stringify(tool.inputSchema ?? {}).length;
   const descLen = tool.description?.length ?? 0;
@@ -126,6 +169,7 @@ class McpPanel {
   private tui: { requestRender(): void };
   private t = DEFAULT_THEME;
   private authOnly: boolean;
+  private keys: PanelKeys;
 
   private static readonly MAX_VISIBLE = 12;
   private static readonly INACTIVITY_MS = 60_000;
@@ -137,11 +181,12 @@ class McpPanel {
     private callbacks: McpPanelCallbacks,
     tui: { requestRender(): void },
     private done: (result: McpPanelResult) => void,
-    options: { noticeLines?: string[]; authOnly?: boolean } = {},
+    options: { noticeLines?: string[]; authOnly?: boolean; keybindings?: PanelKeybindings } = {},
   ) {
     this.tui = tui;
     this.noticeLines = options.noticeLines ?? [];
     this.authOnly = options.authOnly === true;
+    this.keys = createPanelKeys(options.keybindings);
     this.prefix = config.settings?.toolPrefix ?? "server";
 
     for (const [serverName, definition] of Object.entries(config.mcpServers)) {
@@ -318,7 +363,7 @@ class McpPanel {
 
     // Modal description search mode
     if (this.descSearchActive) {
-      if (matchesKey(data, "escape") || matchesKey(data, "return")) {
+      if (matchesKey(data, "escape") || this.keys.selectConfirm(data)) {
         this.descSearchActive = false;
         this.descQuery = "";
         this.rebuildVisibleItems();
@@ -333,8 +378,8 @@ class McpPanel {
         }
         return;
       }
-      if (matchesKey(data, "up")) { this.moveCursor(-1); return; }
-      if (matchesKey(data, "down")) { this.moveCursor(1); return; }
+      if (this.keys.selectUp(data)) { this.moveCursor(-1); return; }
+      if (this.keys.selectDown(data)) { this.moveCursor(1); return; }
       if (matchesKey(data, "space")) {
         // Toggle even while in desc search
         const item = this.visibleItems[this.cursorIndex];
@@ -367,8 +412,8 @@ class McpPanel {
       return;
     }
 
-    if (matchesKey(data, "up")) { this.moveCursor(-1); return; }
-    if (matchesKey(data, "down")) { this.moveCursor(1); return; }
+    if (this.keys.selectUp(data)) { this.moveCursor(-1); return; }
+    if (this.keys.selectDown(data)) { this.moveCursor(1); return; }
 
     if (matchesKey(data, "space")) {
       const item = this.visibleItems[this.cursorIndex];
@@ -376,7 +421,7 @@ class McpPanel {
       return;
     }
 
-    if (matchesKey(data, "return")) {
+    if (this.keys.selectConfirm(data)) {
       const item = this.visibleItems[this.cursorIndex];
       if (!item) return;
       const server = this.servers[item.serverIndex];
@@ -392,7 +437,7 @@ class McpPanel {
         const tool = server.tools[item.toolIndex];
         tool.isDirect = !tool.isDirect;
         if (tool.isDirect && server.source === "import") {
-          this.importNotice = `Imported from ${server.importKind ?? "external"} — will copy to user config on save`;
+          this.importNotice = `Imported from ${sanitizeDisplayText(server.importKind ?? "external")} — will copy to user config on save`;
         }
         this.updateDirty();
       }
@@ -423,8 +468,9 @@ class McpPanel {
         this.tui.requestRender();
       }).catch((error) => {
         server.connectionStatus = "failed";
-        const message = error instanceof Error ? error.message : String(error);
-        this.authNotice = `Reconnect failed for ${server.name}: ${message}`;
+        const message = sanitizeDisplayText(error instanceof Error ? error.message : String(error));
+        const serverName = sanitizeDisplayText(server.name);
+        this.authNotice = `Reconnect failed for ${serverName}: ${message}`;
         this.tui.requestRender();
       });
       return;
@@ -464,26 +510,28 @@ class McpPanel {
 
   private authenticateServer(server: ServerState): void {
     if (this.authInFlight) return;
+    const serverName = sanitizeDisplayText(server.name);
     if (!this.callbacks.canAuthenticate(server.name)) {
-      this.authNotice = `${server.name} does not use OAuth authentication.`;
+      this.authNotice = `${serverName} does not use OAuth authentication.`;
       return;
     }
 
     this.authInFlight = server.name;
-    this.authNotice = `Authenticating ${server.name}...`;
+    this.authNotice = `Authenticating ${serverName}...`;
     this.tui.requestRender();
 
     this.callbacks.authenticate(server.name).then((result) => {
       server.connectionStatus = this.callbacks.getConnectionStatus(server.name);
+      const message = sanitizeDisplayText(result.message);
       this.authNotice = result.ok
-        ? `OAuth finished for ${server.name}. Run reconnect if it is still idle.`
-        : `OAuth failed for ${server.name}${result.message ? `: ${result.message}` : ". Check the notification for details."}`;
+        ? `OAuth finished for ${serverName}. Run reconnect if it is still idle.`
+        : `OAuth failed for ${serverName}${message ? `: ${message}` : ". Check the notification for details."}`;
       this.authInFlight = null;
       this.tui.requestRender();
     }).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = sanitizeDisplayText(error instanceof Error ? error.message : String(error));
       server.connectionStatus = this.callbacks.getConnectionStatus(server.name);
-      this.authNotice = `OAuth failed for ${server.name}: ${message}`;
+      this.authNotice = `OAuth failed for ${serverName}: ${message}`;
       this.authInFlight = null;
       this.tui.requestRender();
     });
@@ -495,14 +543,14 @@ class McpPanel {
     if (item.type === "server") {
       const newState = !server.tools.every((t) => t.isDirect);
       if (server.source === "import" && newState) {
-        this.importNotice = `Imported from ${server.importKind ?? "external"} — will copy to user config on save`;
+        this.importNotice = `Imported from ${sanitizeDisplayText(server.importKind ?? "external")} — will copy to user config on save`;
       }
       for (const t of server.tools) t.isDirect = newState;
     } else if (item.toolIndex !== undefined) {
       const tool = server.tools[item.toolIndex];
       tool.isDirect = !tool.isDirect;
       if (tool.isDirect && server.source === "import") {
-        this.importNotice = `Imported from ${server.importKind ?? "external"} — will copy to user config on save`;
+        this.importNotice = `Imported from ${sanitizeDisplayText(server.importKind ?? "external")} — will copy to user config on save`;
       }
     }
     this.updateDirty();
@@ -518,12 +566,12 @@ class McpPanel {
       this.confirmingDiscard = false;
       return;
     }
-    if (matchesKey(data, "return")) {
+    if (this.keys.selectConfirm(data)) {
+      this.cleanup();
       if (this.discardSelected === 0) {
-        this.cleanup();
         this.done({ cancelled: true, changes: new Map() });
       } else {
-        this.confirmingDiscard = false;
+        this.done(this.buildResult());
       }
       return;
     }
@@ -597,7 +645,7 @@ class McpPanel {
     const inverse = (s: string) => `\x1b[7m${s}\x1b[27m`;
 
     const row = (content: string) =>
-      fg(t.border, "│") + truncateToWidth(" " + content, innerW, "…", true) + fg(t.border, "│");
+      fg(t.border, "│") + truncateToWidth(" " + sanitizeRowContent(content), innerW, "…", true) + fg(t.border, "│");
     const emptyRow = () => fg(t.border, "│") + " ".repeat(innerW) + fg(t.border, "│");
     const divider = () => fg(t.border, "├" + "─".repeat(innerW) + "┤");
 
@@ -622,7 +670,7 @@ class McpPanel {
     lines.push(emptyRow());
     if (this.noticeLines.length > 0) {
       for (const notice of this.noticeLines) {
-        lines.push(row(fg(t.hint, italic(notice))));
+        lines.push(row(fg(t.hint, italic(sanitizeDisplayText(notice)))));
       }
       lines.push(emptyRow());
     }
@@ -661,11 +709,11 @@ class McpPanel {
       }
 
       if (this.importNotice) {
-        lines.push(row(fg(t.needsAuth, italic(this.importNotice))));
+        lines.push(row(fg(t.needsAuth, italic(sanitizeDisplayText(this.importNotice)))));
         lines.push(emptyRow());
       }
       if (this.authNotice) {
-        lines.push(row(fg(t.needsAuth, italic(this.authNotice))));
+        lines.push(row(fg(t.needsAuth, italic(sanitizeDisplayText(this.authNotice)))));
         lines.push(emptyRow());
       }
     }
@@ -678,8 +726,8 @@ class McpPanel {
         ? inverse(bold(fg(t.cancel, "  Discard  ")))
         : fg(t.hint, "  Discard  ");
       const keepBtn = this.discardSelected === 1
-        ? inverse(bold(fg(t.confirm, "  Keep  ")))
-        : fg(t.hint, "  Keep  ");
+        ? inverse(bold(fg(t.confirm, "  Keep & Close  ")))
+        : fg(t.hint, "  Keep & Close  ");
       lines.push(row(`Discard unsaved changes?  ${discardBtn}   ${keepBtn}`));
     } else {
       if (this.authOnly) {
@@ -747,8 +795,10 @@ class McpPanel {
     const expandIcon = server.expanded ? "▾" : "▸";
     const prefix = isCursor ? fg(t.selected, expandIcon) : fg(t.border, server.expanded ? expandIcon : "·");
 
-    const nameStr = isCursor ? bold(fg(t.selected, server.name)) : server.name;
-    const importLabel = server.source === "import" ? fg(t.description, ` (${server.importKind ?? "import"})`) : "";
+    const serverName = sanitizeDisplayText(server.name);
+    const importKind = sanitizeDisplayText(server.importKind ?? "import");
+    const nameStr = isCursor ? bold(fg(t.selected, serverName)) : serverName;
+    const importLabel = server.source === "import" ? fg(t.description, ` (${importKind})`) : "";
     const statusLabel = this.renderConnectionStatus(server);
 
     if (!server.hasCachedData && !this.authOnly) {
@@ -794,13 +844,15 @@ class McpPanel {
 
     const toggleIcon = tool.isDirect ? fg(t.direct, "●") : fg(t.description, "○");
     const cursor = isCursor ? fg(t.selected, "▸") : " ";
-    const nameStr = isCursor ? bold(fg(t.selected, tool.name)) : tool.name;
+    const toolName = sanitizeDisplayText(tool.name);
+    const description = sanitizeDisplayText(tool.description);
+    const nameStr = isCursor ? bold(fg(t.selected, toolName)) : toolName;
 
-    const prefixLen = 7 + visibleWidth(tool.name);
+    const prefixLen = 7 + visibleWidth(toolName);
     const maxDescLen = Math.max(0, innerW - prefixLen - 8);
     const descStr =
-      maxDescLen > 5 && tool.description
-        ? fg(t.description, "— " + truncateToWidth(tool.description, maxDescLen, "…"))
+      maxDescLen > 5 && description
+        ? fg(t.description, "— " + truncateToWidth(description, maxDescLen, "…"))
         : "";
 
     return `  ${cursor} ${toggleIcon} ${nameStr} ${descStr}`;
@@ -820,7 +872,7 @@ export function createMcpPanel(
   callbacks: McpPanelCallbacks,
   tui: { requestRender(): void },
   done: (result: McpPanelResult) => void,
-  options?: { noticeLines?: string[]; authOnly?: boolean },
+  options?: { noticeLines?: string[]; authOnly?: boolean; keybindings?: PanelKeybindings },
 ): McpPanel & { dispose(): void } {
   return new McpPanel(config, cache, provenance, callbacks, tui, done, options ?? {});
 }

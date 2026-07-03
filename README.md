@@ -101,6 +101,8 @@ Use the shared MCP files when you want one setup to work across hosts, and Pi-ow
 
 Pi-specific files are the write targets for imported or shared global servers when Pi needs to persist adapter-only settings such as `directTools`.
 
+In the configuration examples below, `30000` is illustrative only. If `requestTimeoutMs` is omitted or set to `<= 0`, the MCP SDK default timeout is used.
+
 ### Server Options
 
 ```json
@@ -110,7 +112,8 @@ Pi-specific files are the write targets for imported or shared global servers wh
       "command": "npx",
       "args": ["-y", "some-mcp-server"],
       "lifecycle": "lazy",
-      "idleTimeout": 10
+      "idleTimeout": 10,
+      "requestTimeoutMs": 30000
     }
   }
 }
@@ -135,12 +138,33 @@ Pi-specific files are the write targets for imported or shared global servers wh
 | `bearerToken` / `bearerTokenEnv` | Token or env var name; `bearerToken` supports `${VAR}` and `$env:VAR` interpolation |
 | `lifecycle` | `"lazy"` (default), `"eager"`, or `"keep-alive"` |
 | `idleTimeout` | Minutes before idle disconnect (overrides global) |
+| `requestTimeoutMs` | Request timeout in milliseconds for live MCP calls (overrides global; if omitted or `<= 0`, the MCP SDK default timeout is used) |
 | `exposeResources` | Expose MCP resources as tools (default: true) |
 | `directTools` | `true`, `string[]`, or `false` — register tools individually instead of through proxy |
 | `excludeTools` | `string[]` of tool names to hide (matches original names like `get_screenshot` and prefixed names like `figma_get_screenshot`) |
 | `debug` | Show server stderr (default: false) |
 
 For pre-registered browser OAuth clients, set `oauth.redirectUri` to the exact callback registered with the provider, for example `"http://localhost:3118/callback"`. Dynamic clients normally omit it and use a lazy OS-assigned localhost callback port.
+
+### Remote/headless OAuth
+
+If Pi is running on a remote server and cannot open a local browser, start OAuth through the proxy tool:
+
+```js
+mcp({ action: "auth-start", server: "linear-server" })
+```
+
+Open the returned authorization URL in your local browser. After approval, your browser redirects to a localhost URL. On a remote server that local page may fail to load; copy the full URL from the browser address bar anyway and complete the flow in the same Pi session:
+
+```js
+mcp({
+  action: "auth-complete",
+  server: "linear-server",
+  args: '{"redirectUrl":"http://localhost:19876/callback?code=...&state=..."}'
+})
+```
+
+You can also pass only the `code` query parameter with `args: '{"code":"..."}'`. Treat authorization URLs and codes as sensitive; they can grant access to the MCP server until the flow expires or completes.
 
 ### Lifecycle Modes
 
@@ -154,7 +178,8 @@ For pre-registered browser OAuth clients, set `oauth.redirectUri` to the exact c
 {
   "settings": {
     "toolPrefix": "server",
-    "idleTimeout": 10
+    "idleTimeout": 10,
+    "requestTimeoutMs": 30000
   },
   "mcpServers": { }
 }
@@ -164,13 +189,42 @@ For pre-registered browser OAuth clients, set `oauth.redirectUri` to the exact c
 |---------|-------------|
 | `toolPrefix` | `"server"` (default), `"short"` (strips `-mcp` suffix), or `"none"` |
 | `idleTimeout` | Global idle timeout in minutes (default: 10, 0 to disable) |
+| `requestTimeoutMs` | Global request timeout in milliseconds for live MCP calls (if omitted or `<= 0`, the MCP SDK default timeout is used) |
 | `directTools` | Global default for all servers (default: false). Per-server overrides this. |
 | `disableProxyTool` | Hide the `mcp` proxy tool once configured direct tools are fully available from cache. |
 | `autoAuth` | Auto-run OAuth on `connect`/tool calls when a server needs auth, then retry once (default: false). |
 | `sampling` | Allow MCP servers to sample through Pi models, honoring `modelPreferences.hints` before current/default fallback (default: true when UI approval is available). |
 | `samplingAutoApprove` | Skip sampling confirmation prompts. Required for sampling in non-UI sessions (default: false). |
+| `elicitation` | Allow MCP servers to request user input through Pi dialogs (default: true when Pi UI is available). |
+| `outputGuard` | Guard oversized MCP output: `true` (default), `false`, or `{ maxBytes, maxLines, detailsMaxBytes }`. See [Output Guard](#output-guard). |
 
-Per-server `idleTimeout` overrides the global setting.
+Per-server `idleTimeout` and `requestTimeoutMs` override the global settings.
+
+### Output Guard
+
+Oversized MCP tool/resource results are guarded by default so a single huge response can't blow up the model context window or the session file:
+
+- Inline text output is capped at **50 KiB / 2,000 lines** (matching Pi's built-in `bash` guard). Larger output is truncated to a head preview and the full text is saved to a temp file whose path is included in the result, so the agent can `read`/`grep` it.
+- **Image content blocks pass through unchanged** — only text output is guarded. Images are delivered to the provider as native image content.
+- In proxy mode, `details.mcpResult` is kept raw when its JSON is **≤ 16 KiB**; larger results are replaced with a compact summary (block counts, sizes, key previews) and the raw JSON is saved to a temp file. Direct tools keep their lean details and never carry `mcpResult`.
+
+Tune the limits with the object form:
+
+```json
+{
+  "settings": {
+    "outputGuard": { "maxBytes": 51200, "maxLines": 2000, "detailsMaxBytes": 16384 }
+  }
+}
+```
+
+Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — to disable the guard and restore raw output behavior. Saved temp files are created with mode `0600` under the system temp directory and are not cleaned up automatically; note that spilled MCP output may contain sensitive data.
+
+### MCP Elicitation
+
+When Pi exposes dialog-capable UI, the adapter advertises form elicitation support. Forms use Pi's stock `select()` and `input()` dialogs, validate the response, and provide a review/edit step before submission. Explicit refusal maps to MCP `decline`; dismissing a dialog maps to `cancel`.
+
+URL mode is advertised only in TUI mode. The adapter displays the requesting server, target host, and full URL, and always requires consent before opening the browser. It also handles URL-required tool errors (`-32042`) and completion notifications; after completing the browser interaction, retry the original tool call.
 
 ### Direct Tools
 
@@ -339,6 +393,8 @@ Prefer `.mcp.json` for project-local shared MCP config. Use `.pi/mcp.json` only 
 | Call | `mcp({ tool: "...", args: '{"key": "value"}' })` |
 | Connect | `mcp({ connect: "server-name" })` |
 | UI messages | `mcp({ action: "ui-messages" })` |
+| Auth start | `mcp({ action: "auth-start", server: "name" })` |
+| Auth complete | `mcp({ action: "auth-complete", server: "name", args: '{"redirectUrl":"..."}' })` |
 
 MCP proxy and direct-tool results render compactly by default: long text shows the first three lines plus a `Ctrl+O to expand` hint, while the full result remains available when expanded and is still returned unchanged to the model.
 
@@ -361,7 +417,7 @@ Tool names are fuzzy-matched on hyphens and underscores — `context7_resolve_li
 
 If `settings.autoAuth` is `true`, `mcp({ connect: ... })`, `mcp({ tool: ... })`, and direct tool calls automatically run OAuth when needed and retry once.
 
-In interactive sessions, you can also authenticate from `/mcp` with `ctrl+a` or Enter on a server that needs auth. In non-interactive sessions, browser-based OAuth still requires `/mcp-auth <server>`. `/mcp-auth` without a server only opens a picker in the interactive UI.
+In interactive sessions, you can also authenticate from `/mcp` with `ctrl+a` or Enter on a server that needs auth. In remote/headless sessions, use the proxy tool's `auth-start` and `auth-complete` actions to copy the authorization URL locally and paste the redirect URL back into Pi. `/mcp-auth` without a server only opens a picker in the interactive UI.
 
 ## How It Works
 
